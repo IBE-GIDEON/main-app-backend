@@ -1,0 +1,13 @@
+openai>=1.40.0
+pydantic>=2.0.0
+asyncache
+cachetools
+python-dotenv
+fastapi
+uvicorn[standard]
+openai
+cachetools
+slowapi
+cryptography
+httpx
+python-multipart
