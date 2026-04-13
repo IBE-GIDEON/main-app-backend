@@ -1,58 +1,11 @@
 """
-output.py — Think AI UI Output Layer
-=====================================
-Responsibility:  Take a RefinedDecision from refiner.py and produce the
-                 exact JSON payload the React Decision Board consumes.
-                 Also handles box branching — when a user clicks a
-                 spawn_question, this layer runs a lightweight mini-pipeline
-                 (route → refine) on that sub-question without the caller
-                 knowing or caring about the internals.
+output.py — Three AI Finance UI Output Layer
 
-Architecture
-------------
-  RefinedDecision (from refiner.py)
-        │
-        ▼
-  format_for_ui()          ← main formatter, called by your API handler
-        │
-        ▼
-  UIDecisionPayload        ← what React receives, field-for-field
-
-  branch_on_question()     ← called when user clicks a spawn_question box
-        │
-        ├─ route()  (router.py)
-        ├─ refine() (refiner.py)
-        └─ format_for_ui()
-              │
-              ▼
-        UIDecisionPayload  ← same shape, so React needs zero changes
-
-Security & scalability
------------------------
-* Zero re-definition — imports everything from router.py and refiner.py.
-* Tenant-scoped TTL cache for branch results (same keys as router/refiner).
-* Input sanitisation before any branch query reaches the LLM.
-* Observability: latency + structured logs on every format and branch call.
-* Narrow exception catches — real bugs surface, fallbacks stay honest.
-
-Usage
------
-    from router import route, UserContext
-    from refiner import refine
-    from output import format_for_ui, branch_on_question
-
-    # Normal flow
-    plan     = await route(query, company_id, context)
-    decision = await refine(query, plan, company_id, context)
-    payload  = format_for_ui(decision, query, company_id)
-
-    # User clicks a spawn_question box
-    branch   = await branch_on_question(
-        question   = "What if our churn rate is already above 5%?",
-        parent_query = query,
-        company_id = company_id,
-        context    = context,
-    )
+Finance-first changes:
+- Adds finance_snapshot to UIDecisionPayload
+- Surfaces finance metrics, source freshness, and evidence notes
+- Extends audit output with finance-specific fields when available
+- Keeps branching + caching behavior
 """
 
 from __future__ import annotations
@@ -60,40 +13,28 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from typing import Literal
+from datetime import datetime, timezone
+from typing import Literal, Any
 
 from pydantic import BaseModel, Field
 from cachetools import TTLCache
 
-# ── Import everything — zero re-definition ────────────────────────────────
 from router import route, UserContext, RoutingPlan
 from refiner import (
-    refine,
-    RefinedDecision,
-    DecisionBox,
-    VerdictBox,
-    NextStepBox,
-    AuditTrail,
+    refine, RefinedDecision, DecisionBox, VerdictBox,
+    NextStepBox, AuditTrail, ReasoningTrail,
 )
 
 import os
-_CACHE_TTL    = int(os.getenv("THINK_AI_CACHE_TTL",   "3600"))
+_CACHE_TTL     = int(os.getenv("THINK_AI_CACHE_TTL",  "3600"))
 _CACHE_MAXSIZE = int(os.getenv("THINK_AI_CACHE_MAX",  "2000"))
 _MAX_QUERY_LEN = int(os.getenv("THINK_AI_MAX_QUERY",  "2000"))
-
-# ─────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("think-ai.output")
-
-# ─────────────────────────────────────────────
-# COLOR MAP  (backend Literal → UI badge label)
-# ─────────────────────────────────────────────
+logger = logging.getLogger("three-ai.output")
 
 COLOR_BADGE: dict[str, str] = {
     "Green":  "🟢 Good to Go",
@@ -111,100 +52,143 @@ COLOR_HEX: dict[str, str] = {
 
 
 # ─────────────────────────────────────────────
-# UI SCHEMAS  (field-for-field React contract)
+# UI SCHEMAS
 # ─────────────────────────────────────────────
 
 class UIBadge(BaseModel):
-    label:  str    # e.g. "🟢 Good to Go"
-    color:  str    # hex e.g. "#22c55e"
-    raw:    str    # e.g. "Green" — for programmatic use in React
+    label: str
+    color: str
+    raw: str
 
 
 class UIBox(BaseModel):
-    """One rendered card on the Decision Board."""
-    id:                    str    # stable, deterministic — safe for React key prop
-    box_type:              Literal["summary", "upside", "risk", "verdict", "next_step"]
-    title:                 str
-    badge:                 UIBadge
-    claim:                 str
+    id: str
+    box_type: Literal["summary", "upside", "risk", "verdict", "next_step"]
+    title: str
+    badge: UIBadge
+    claim: str
     evidence_or_reasoning: str
-    probability:           int | None   = None   # None for summary/verdict/next_step
-    impact:                int | None   = None
-    risk_score:            float | None = None
-    follow_up_actions:     list[str]    = Field(default_factory=list)
-    spawn_questions:       list[str]    = Field(default_factory=list)
-    # spawn_questions powers the branching — clicking reveals sub-decisions
+    probability: int | None = None
+    impact: int | None = None
+    risk_score: float | None = None
+    follow_up_actions: list[str] = Field(default_factory=list)
+    spawn_questions: list[str] = Field(default_factory=list)
 
 
 class UIVerdictCard(BaseModel):
-    """The full verdict section — separate from the box grid."""
-    badge:           UIBadge
-    headline:        str
-    rationale:       str
-    net_score:       float
-    go_conditions:   list[str]
+    badge: UIBadge
+    headline: str
+    rationale: str
+    net_score: float
+    go_conditions: list[str]
     stop_conditions: list[str]
     review_triggers: list[str]
-    key_unknown:     str
-    flip_factor:     str
+    key_unknown: str
+    flip_factor: str
 
 
 class UINextStep(BaseModel):
-    immediate_action:  str
+    immediate_action: str
     test_if_uncertain: str | None = None
-    owner:             str | None = None
-    deadline:          str | None = None
-    escalate_if:       str | None = None
+    owner: str | None = None
+    deadline: str | None = None
+    escalate_if: str | None = None
 
 
 class UIAudit(BaseModel):
-    """Shown only in dev mode / audit view — never in the main decision board."""
-    query_hash:        str
-    company_id:        str
+    query_hash: str
+    company_id: str
     routing_plan_hash: str
-    model_used:        str
+    model_used: str
     pass_latencies_ms: list[int]
-    total_tokens_in:   int
-    total_tokens_out:  int
-    refiner_version:   str
-    timestamp_utc:     str
-    output_latency_ms: int    # time spent in this layer
+    total_tokens_in: int
+    total_tokens_out: int
+    refiner_version: str
+    timestamp_utc: str
+    output_latency_ms: int
+
+    # finance-aware audit fields
+    finance_snapshot_hash: str | None = None
+    data_as_of_utc: str | None = None
+    cache_bypassed: bool | None = None
+
+
+class UIFinanceSnapshot(BaseModel):
+    as_of_utc: str | None = None
+    currency: str | None = None
+    reporting_period: str | None = None
+    analysis_horizon_days: int | None = None
+    is_live_data: bool = False
+
+    sources_used: list[str] = Field(default_factory=list)
+    source_freshness: dict[str, str] = Field(default_factory=dict)
+
+    cash_balance: float | None = None
+    available_liquidity: float | None = None
+    monthly_burn: float | None = None
+    runway_months: float | None = None
+
+    mrr: float | None = None
+    arr: float | None = None
+    revenue_last_30d: float | None = None
+    revenue_prev_30d: float | None = None
+    revenue_growth_pct: float | None = None
+
+    gross_margin_pct: float | None = None
+    ebitda_margin_pct: float | None = None
+    net_margin_pct: float | None = None
+
+    opex_last_30d: float | None = None
+    opex_prev_30d: float | None = None
+    opex_growth_pct: float | None = None
+
+    ar_total: float | None = None
+    ar_overdue_30_plus: float | None = None
+    ap_total: float | None = None
+    ap_due_30d: float | None = None
+
+    failed_payment_rate_pct: float | None = None
+    customer_concentration_pct: float | None = None
+    top_customer_share_pct: float | None = None
+    logo_churn_pct: float | None = None
+    revenue_churn_pct: float | None = None
+    nrr_pct: float | None = None
+
+    pipeline_coverage: float | None = None
+    forecast_vs_actual_pct: float | None = None
+
+    debt_service_coverage_ratio: float | None = None
+    current_ratio: float | None = None
+    quick_ratio: float | None = None
+    covenant_headroom_pct: float | None = None
+
+    headcount: int | None = None
+    notes: list[str] = Field(default_factory=list)
 
 
 class UIDecisionPayload(BaseModel):
-    """
-    The complete payload sent to the React Decision Board.
-    Field names match the UI spec 1-to-1:
-        summary_box, upside_boxes[], risk_boxes[],
-        verdict_box, next_step_box, confidence.
-    MAX 5 BOXES TOTAL in the grid (enforced here).
-    """
-    # ── Meta ───────────────────────────────────────────────────────────────
-    query:              str
-    company_id:         str
-    confidence:         float
-    total_boxes:        int
+    query: str
+    company_id: str
+    confidence: float
+    total_boxes: int
 
-    # ── The grid — what React maps over ────────────────────────────────────
-    summary_box:        UIBox
-    upside_boxes:       list[UIBox]
-    risk_boxes:         list[UIBox]
+    summary_box: UIBox
+    upside_boxes: list[UIBox]
+    risk_boxes: list[UIBox]
 
-    # ── Below-the-grid panels ───────────────────────────────────────────────
-    verdict_card:       UIVerdictCard
-    next_step:          UINextStep
+    verdict_card: UIVerdictCard
+    next_step: UINextStep
+    audit: UIAudit
 
-    # ── Dev / audit (hidden from default UI) ───────────────────────────────
-    audit:              UIAudit
+    is_branch: bool = False
+    parent_query: str | None = None
 
-    # ── Branching state ────────────────────────────────────────────────────
-    is_branch:          bool = False     # True if this payload is a branch result
-    parent_query:       str | None = None
+    reasoning_trail: ReasoningTrail | None = None
+    finance_snapshot: UIFinanceSnapshot | None = None
 
 
 # ─────────────────────────────────────────────
-# CACHE  (branch results only — main results
-#         are already cached in router + refiner)
+# CACHE
 # ─────────────────────────────────────────────
 
 _branch_cache: TTLCache = TTLCache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
@@ -220,10 +204,6 @@ def _branch_cache_key(company_id: str, question: str, parent_query: str) -> str:
 # ─────────────────────────────────────────────
 
 def _box_id(company_id: str, box_type: str, title: str) -> str:
-    """
-    Stable, deterministic box ID — safe as a React key prop.
-    Deterministic means re-renders won't cause flicker.
-    """
     raw = f"{company_id}:{box_type}:{title.lower().strip()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -253,18 +233,11 @@ def _format_decision_box(box: DecisionBox, box_type: str, company_id: str) -> UI
 
 
 def _sanitise_query(raw: str) -> str:
-    """
-    Strip, truncate, and block prompt-injection patterns
-    before any user string reaches the LLM.
-    """
     cleaned = raw.strip()
-
-    # Hard length cap
     if len(cleaned) > _MAX_QUERY_LEN:
         cleaned = cleaned[:_MAX_QUERY_LEN]
         logger.warning("Query truncated to %d chars", _MAX_QUERY_LEN)
 
-    # Block obvious injection patterns
     injection_patterns = [
         "ignore previous instructions",
         "ignore all instructions",
@@ -279,8 +252,109 @@ def _sanitise_query(raw: str) -> str:
         if pattern in lower:
             logger.warning("Injection pattern detected and blocked: '%s'", pattern)
             raise ValueError(f"Query contains disallowed pattern: '{pattern}'")
-
     return cleaned
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_finance_snapshot(context: UserContext | None) -> UIFinanceSnapshot | None:
+    if not context or not getattr(context, "extra", None):
+        return None
+
+    extra = context.extra or {}
+
+    sources_used = extra.get("sources_used", [])
+    if not isinstance(sources_used, list):
+        sources_used = []
+
+    source_freshness = extra.get("source_freshness", {})
+    if not isinstance(source_freshness, dict):
+        source_freshness = {}
+
+    notes = extra.get("evidence_notes", [])
+    if not isinstance(notes, list):
+        notes = []
+
+    snapshot = UIFinanceSnapshot(
+        as_of_utc=extra.get("as_of_utc"),
+        currency=extra.get("currency"),
+        reporting_period=extra.get("reporting_period"),
+        analysis_horizon_days=_to_int(extra.get("analysis_horizon_days")),
+        is_live_data=bool(extra.get("is_live_data", False)),
+
+        sources_used=[str(x) for x in sources_used],
+        source_freshness={str(k): str(v) for k, v in source_freshness.items()},
+
+        cash_balance=_to_float(extra.get("cash_balance")),
+        available_liquidity=_to_float(extra.get("available_liquidity")),
+        monthly_burn=_to_float(extra.get("monthly_burn")),
+        runway_months=_to_float(extra.get("runway_months")),
+
+        mrr=_to_float(extra.get("mrr")),
+        arr=_to_float(extra.get("arr")),
+        revenue_last_30d=_to_float(extra.get("revenue_last_30d")),
+        revenue_prev_30d=_to_float(extra.get("revenue_prev_30d")),
+        revenue_growth_pct=_to_float(extra.get("revenue_growth_pct")),
+
+        gross_margin_pct=_to_float(extra.get("gross_margin_pct")),
+        ebitda_margin_pct=_to_float(extra.get("ebitda_margin_pct")),
+        net_margin_pct=_to_float(extra.get("net_margin_pct")),
+
+        opex_last_30d=_to_float(extra.get("opex_last_30d")),
+        opex_prev_30d=_to_float(extra.get("opex_prev_30d")),
+        opex_growth_pct=_to_float(extra.get("opex_growth_pct")),
+
+        ar_total=_to_float(extra.get("ar_total")),
+        ar_overdue_30_plus=_to_float(extra.get("ar_overdue_30_plus")),
+        ap_total=_to_float(extra.get("ap_total")),
+        ap_due_30d=_to_float(extra.get("ap_due_30d")),
+
+        failed_payment_rate_pct=_to_float(extra.get("failed_payment_rate_pct")),
+        customer_concentration_pct=_to_float(extra.get("customer_concentration_pct")),
+        top_customer_share_pct=_to_float(extra.get("top_customer_share_pct")),
+        logo_churn_pct=_to_float(extra.get("logo_churn_pct")),
+        revenue_churn_pct=_to_float(extra.get("revenue_churn_pct")),
+        nrr_pct=_to_float(extra.get("nrr_pct")),
+
+        pipeline_coverage=_to_float(extra.get("pipeline_coverage")),
+        forecast_vs_actual_pct=_to_float(extra.get("forecast_vs_actual_pct")),
+
+        debt_service_coverage_ratio=_to_float(extra.get("debt_service_coverage_ratio")),
+        current_ratio=_to_float(extra.get("current_ratio")),
+        quick_ratio=_to_float(extra.get("quick_ratio")),
+        covenant_headroom_pct=_to_float(extra.get("covenant_headroom_pct")),
+
+        headcount=_to_int(extra.get("headcount")),
+        notes=[str(x) for x in notes],
+    )
+
+    has_real_data = any(
+        getattr(snapshot, field_name) is not None
+        for field_name in [
+            "cash_balance", "monthly_burn", "runway_months",
+            "mrr", "arr", "revenue_last_30d", "revenue_growth_pct",
+            "gross_margin_pct", "ar_overdue_30_plus",
+            "failed_payment_rate_pct", "customer_concentration_pct"
+        ]
+    ) or bool(snapshot.sources_used)
+
+    return snapshot if has_real_data else None
 
 
 # ─────────────────────────────────────────────
@@ -288,35 +362,16 @@ def _sanitise_query(raw: str) -> str:
 # ─────────────────────────────────────────────
 
 def format_for_ui(
-    decision:   RefinedDecision,
-    query:      str,
+    decision: RefinedDecision,
+    query: str,
     company_id: str,
     *,
-    is_branch:    bool = False,
+    context: UserContext | None = None,
+    is_branch: bool = False,
     parent_query: str | None = None,
 ) -> UIDecisionPayload:
-    """
-    Transforms a RefinedDecision into the exact UIDecisionPayload
-    the React Decision Board expects.
-
-    This is a pure, synchronous function — no LLM calls, no I/O.
-    Safe to call as many times as needed (e.g. for streaming updates).
-
-    Parameters
-    ----------
-    decision     : Output from refiner.refine().
-    query        : The original decision text.
-    company_id   : Tenant identifier.
-    is_branch    : True when formatting a branch / sub-decision result.
-    parent_query : The query that spawned this branch.
-
-    Returns
-    -------
-    UIDecisionPayload — always. Never raises.
-    """
     t0 = time.perf_counter()
 
-    # ── Summary box ────────────────────────────────────────────────────────
     verdict_color = decision.verdict_box.color
     summary_ui = UIBox(
         id=_box_id(company_id, "summary", "summary"),
@@ -325,26 +380,11 @@ def format_for_ui(
         badge=_make_badge(verdict_color),
         claim=decision.summary_box,
         evidence_or_reasoning="",
-        probability=None,
-        impact=None,
-        risk_score=None,
-        follow_up_actions=[],
-        spawn_questions=[],
     )
 
-    # ── Upside boxes ───────────────────────────────────────────────────────
-    upside_ui = [
-        _format_decision_box(b, "upside", company_id)
-        for b in decision.upside_boxes
-    ]
+    upside_ui = [_format_decision_box(b, "upside", company_id) for b in decision.upside_boxes]
+    risk_ui = [_format_decision_box(b, "risk", company_id) for b in decision.risk_boxes]
 
-    # ── Risk boxes ─────────────────────────────────────────────────────────
-    risk_ui = [
-        _format_decision_box(b, "risk", company_id)
-        for b in decision.risk_boxes
-    ]
-
-    # ── Verdict card ───────────────────────────────────────────────────────
     vb = decision.verdict_box
     verdict_ui = UIVerdictCard(
         badge=_make_badge(vb.color),
@@ -358,7 +398,6 @@ def format_for_ui(
         flip_factor=vb.flip_factor,
     )
 
-    # ── Next step ──────────────────────────────────────────────────────────
     ns = decision.next_step_box
     next_step_ui = UINextStep(
         immediate_action=ns.immediate_action,
@@ -368,7 +407,6 @@ def format_for_ui(
         escalate_if=ns.escalate_if,
     )
 
-    # ── Audit ──────────────────────────────────────────────────────────────
     output_latency_ms = round((time.perf_counter() - t0) * 1000)
     a = decision.audit
     audit_ui = UIAudit(
@@ -382,19 +420,23 @@ def format_for_ui(
         refiner_version=a.refiner_version,
         timestamp_utc=a.timestamp_utc,
         output_latency_ms=output_latency_ms,
+        finance_snapshot_hash=getattr(a, "finance_snapshot_hash", None),
+        data_as_of_utc=getattr(a, "data_as_of_utc", None),
+        cache_bypassed=getattr(a, "cache_bypassed", None),
     )
 
+    finance_snapshot = _build_finance_snapshot(context)
     total_boxes = len(upside_ui) + len(risk_ui)
 
     logger.info(
-        "✅ Formatted | company=%s | verdict=%s | boxes=%d | "
-        "conf=%.2f | output_latency_ms=%d | branch=%s",
+        "✅ Formatted | company=%s | verdict=%s | boxes=%d | conf=%.2f | output_latency_ms=%d | branch=%s | finance_snapshot=%s",
         company_id,
         verdict_color,
         total_boxes,
         decision.confidence,
         output_latency_ms,
         is_branch,
+        bool(finance_snapshot),
     )
 
     return UIDecisionPayload(
@@ -410,74 +452,42 @@ def format_for_ui(
         audit=audit_ui,
         is_branch=is_branch,
         parent_query=parent_query,
+        reasoning_trail=decision.reasoning_trail,
+        finance_snapshot=finance_snapshot,
     )
 
 
 # ─────────────────────────────────────────────
-# BRANCHING  — user clicks a spawn_question
+# BRANCHING
 # ─────────────────────────────────────────────
 
 async def branch_on_question(
-    question:     str,
+    question: str,
     parent_query: str,
-    company_id:   str,
-    context:      UserContext | None = None,
+    company_id: str,
+    context: UserContext | None = None,
     *,
     bypass_cache: bool = False,
 ) -> UIDecisionPayload:
-    """
-    Called when a user clicks a spawn_question on any decision box.
-    Runs the full route → refine → format_for_ui pipeline on the
-    sub-question, returning a UIDecisionPayload in the same shape
-    so React needs zero changes to render it.
-
-    The branch result is independently cached so repeated clicks
-    on the same spawn_question are instant.
-
-    Parameters
-    ----------
-    question     : The spawn_question text (from a DecisionBox).
-    parent_query : The original query that produced the parent decision.
-    company_id   : Tenant identifier.
-    context      : Same UserContext from the parent decision.
-    bypass_cache : Force fresh analysis on this branch.
-
-    Returns
-    -------
-    UIDecisionPayload — always. Falls back gracefully on failure.
-    """
-
-    # ── Input sanitisation ─────────────────────────────────────────────────
     try:
-        question     = _sanitise_query(question)
+        question = _sanitise_query(question)
         parent_query = _sanitise_query(parent_query)
     except ValueError as e:
         logger.warning("Branch blocked | company=%s | reason=%s", company_id, e)
-        return _branch_fallback(question, parent_query, company_id, str(e))
+        return _branch_fallback(question, parent_query, company_id, str(e), context=context)
 
     if not question:
-        return _branch_fallback(question, parent_query, company_id, "empty_question")
+        return _branch_fallback(question, parent_query, company_id, "empty_question", context=context)
 
-    # ── Cache lookup ───────────────────────────────────────────────────────
     cache_key = _branch_cache_key(company_id, question, parent_query)
-
     if not bypass_cache and cache_key in _branch_cache:
-        logger.info(
-            "Branch cache hit | company=%s | key=%s…",
-            company_id, cache_key[:12],
-        )
+        logger.info("Branch cache hit | company=%s | key=%s…", company_id, cache_key[:12])
         return _branch_cache[cache_key]
 
-    logger.info(
-        "🌿 Branch | company=%s | question=%s…",
-        company_id, question[:60],
-    )
+    logger.info("🌿 Branch | company=%s | question=%s…", company_id, question[:60])
 
-    # ── Enrich the branch context with the parent query ────────────────────
-    # This means the router and refiner know this is a sub-question,
-    # not a cold-start decision — produces tighter, more relevant output.
     branch_context = UserContext(
-        industry=context.industry       if context else None,
+        industry=context.industry if context else None,
         company_size=context.company_size if context else None,
         risk_appetite=context.risk_appetite if context else None,
         extra={
@@ -488,39 +498,34 @@ async def branch_on_question(
     )
 
     try:
-        plan     = await route(question, company_id, branch_context)
-        decision = await refine(question, plan, company_id, branch_context)
-        payload  = format_for_ui(
+        plan = await route(question, company_id, branch_context, bypass_cache=bypass_cache)
+        decision = await refine(question, plan, company_id, branch_context, bypass_cache=bypass_cache)
+        payload = format_for_ui(
             decision,
             question,
             company_id,
+            context=branch_context,
             is_branch=True,
             parent_query=parent_query,
         )
     except Exception as e:
-        logger.error(
-            "Branch failed | company=%s | question=%s | %s",
-            company_id, question[:60], e,
-        )
-        return _branch_fallback(question, parent_query, company_id, "pipeline_failure")
+        logger.error("Branch failed | company=%s | question=%s | %s", company_id, question[:60], e)
+        return _branch_fallback(question, parent_query, company_id, "pipeline_failure", context=branch_context)
 
     _branch_cache[cache_key] = payload
     return payload
 
 
-# ─────────────────────────────────────────────
-# BRANCH FALLBACK
-# ─────────────────────────────────────────────
-
 def _branch_fallback(
-    question:     str,
+    question: str,
     parent_query: str,
-    company_id:   str,
-    reason:       str,
+    company_id: str,
+    reason: str,
+    *,
+    context: UserContext | None = None,
 ) -> UIDecisionPayload:
-    logger.warning(
-        "Branch fallback | company=%s | reason=%s", company_id, reason
-    )
+    logger.warning("Branch fallback | company=%s | reason=%s", company_id, reason)
+
     placeholder = UIBox(
         id=_box_id(company_id, "risk", "branch-fallback"),
         box_type="risk",
@@ -531,6 +536,7 @@ def _branch_fallback(
         follow_up_actions=["Retry", "Rephrase the question"],
         spawn_questions=[],
     )
+
     return UIDecisionPayload(
         query=question,
         company_id=company_id,
@@ -558,7 +564,7 @@ def _branch_fallback(
             flip_factor="Could not determine",
         ),
         next_step=UINextStep(
-            immediate_action="Retry the sub-question or simplify it.",
+            immediate_action="Retry the sub-question or simplify it."
         ),
         audit=UIAudit(
             query_hash=hashlib.sha256(question.encode()).hexdigest(),
@@ -568,63 +574,15 @@ def _branch_fallback(
             pass_latencies_ms=[0, 0, 0],
             total_tokens_in=0,
             total_tokens_out=0,
-            refiner_version="1.0.0",
-            timestamp_utc="",
+            refiner_version="2.0.0-finance",
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
             output_latency_ms=0,
+            finance_snapshot_hash=None,
+            data_as_of_utc=None,
+            cache_bypassed=True,
         ),
         is_branch=True,
         parent_query=parent_query,
+        reasoning_trail=None,
+        finance_snapshot=_build_finance_snapshot(context),
     )
-
-
-# ─────────────────────────────────────────────
-# QUICK LOCAL TEST
-# ─────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import asyncio
-    import json
-    from router import route, UserContext
-    from refiner import refine
-
-    async def _demo():
-        query = "Should we raise our prices by 20% next month?"
-        ctx   = UserContext(
-            industry="E-commerce",
-            company_size="Series A",
-            risk_appetite="Moderate",
-        )
-
-        print("── Step 1: Router ──────────────────────────────")
-        plan = await route(query, "demo-co", ctx)
-        print(f"  {plan.decision_type} | {plan.stake_level} | {plan.framework}")
-
-        print("\n── Step 2: Refiner ─────────────────────────────")
-        decision = await refine(query, plan, "demo-co", ctx)
-        print(f"  Verdict: {decision.verdict_box.color} — {decision.verdict_box.headline}")
-
-        print("\n── Step 3: Output (format_for_ui) ──────────────")
-        payload = format_for_ui(decision, query, "demo-co")
-        print(f"  Badge  : {payload.verdict_card.badge.label}")
-        print(f"  Boxes  : {payload.total_boxes}")
-        print(f"  Conf   : {payload.confidence:.0%}")
-
-        for b in payload.upside_boxes:
-            print(f"  [UPSIDE] {b.title} | {b.badge.label} | score={b.risk_score}")
-        for b in payload.risk_boxes:
-            print(f"  [RISK]   {b.title} | {b.badge.label} | score={b.risk_score}")
-
-        print(f"\n  Go conditions   : {payload.verdict_card.go_conditions}")
-        print(f"  Stop conditions : {payload.verdict_card.stop_conditions}")
-        print(f"  Next step       : {payload.next_step.immediate_action}")
-
-        # ── Test branching ─────────────────────────────────────────────────
-        if payload.upside_boxes and payload.upside_boxes[0].spawn_questions:
-            sub_q = payload.upside_boxes[0].spawn_questions[0]
-            print(f"\n── Step 4: Branch on '{sub_q[:50]}…' ──")
-            branch = await branch_on_question(sub_q, query, "demo-co", ctx)
-            print(f"  Branch verdict : {branch.verdict_card.badge.label}")
-            print(f"  Branch is_branch: {branch.is_branch}")
-            print(f"  Branch boxes   : {branch.total_boxes}")
-
-    asyncio.run(_demo())

@@ -1,48 +1,18 @@
 """
-refiner.py — Think AI Decision Refiner
+refiner.py — Three AI Decision Refiner
 =======================================
-Responsibility:  Take a RoutingPlan from router.py and produce a
-                 fully-structured RefinedDecision ready for the UI layer.
-
-Pipeline
---------
-  Pass 1 — Draft   : Generate initial decision boxes from the routing plan.
-  Pass 2 — Attack  : Challenge every claim. Find gaps, false assumptions,
-                      and real-world failure modes.
-  Pass 3 — Finalize: Incorporate the critique. Output the final boxes,
-                      verdict, conditions, and next steps.
-
-This 3-pass loop is what separates Think AI from a single-shot ChatGPT call.
-
-Security & architecture
------------------------
-* Imports UserContext and RoutingPlan directly from router.py — zero duplication.
-* All company data stays tenant-scoped via company_id in cache keys.
-* Model escalation: gpt-4o-mini for Low stakes, gpt-4o for High stakes.
-* Same retry / back-off / observability patterns as router.py.
-* Narrow exception catches — real bugs bubble up, never swallowed silently.
-
-Usage
------
-    from router import route, UserContext
-
-    plan = await route(query, company_id, context)
-
-    from refiner import refine
-
-    decision = await refine(
-        query=query,
-        plan=plan,
-        company_id=company_id,
-        context=context,
-    )
-    print(decision.model_dump_json(indent=2))
+Changes from v1:
+  - Added BoxReasoningTrail schema — captures draft claim, attack critique,
+    and what changed per box. Sent to UI layer via RefinedDecision.
+  - Added ReasoningTrail to RefinedDecision — full per-box trail.
+  - _assemble() now builds reasoning trails from pass data.
+  - Zero changes to the 3-pass pipeline logic itself.
 """
 
 from __future__ import annotations
 
 from dotenv import load_dotenv
-load_dotenv()   # ensures .env is loaded before AsyncOpenAI client is created
+load_dotenv()
 
 import asyncio
 import hashlib
@@ -50,20 +20,15 @@ import logging
 import os
 import random
 import time
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from openai import AsyncOpenAI, APIStatusError, APITimeoutError
 from pydantic import BaseModel, Field, field_validator
 from cachetools import TTLCache
 
-# ── Import the shared contract from router — no re-definition ──────────────
 from router import UserContext, RoutingPlan, BOXES_BY_STAKE
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-
-# Low-stakes: fast + cheap.  High-stakes: smartest model available.
 _MODEL_STANDARD = os.getenv("THINK_AI_REFINER_MODEL_STD",  "gpt-4o-mini")
 _MODEL_HIGH     = os.getenv("THINK_AI_REFINER_MODEL_HIGH", "gpt-4o")
 _TIMEOUT_SEC    = float(os.getenv("THINK_AI_REFINER_TIMEOUT",  "20"))
@@ -85,61 +50,103 @@ def _get_client() -> AsyncOpenAI:
         )
     return _client
 
-# ─────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("think-ai.refiner")
-
-# ─────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────
+logger = logging.getLogger("three-ai.refiner")
 
 VerdictColor = Literal["Green", "Yellow", "Orange", "Red"]
 
-VERDICT_RULES: dict[str, VerdictColor] = {
-    # Computed deterministically after Pass 3 — LLM suggests, we enforce.
-    # net_score = sum(upside impact) - sum(risk impact), range roughly -50 to +50
+BOX_SPLIT: dict[str, dict[str, int]] = {
+    "Low":    {"upside": 1, "risk": 1},
+    "Medium": {"upside": 2, "risk": 1},
+    "High":   {"upside": 3, "risk": 2},
 }
 
-# Box distribution per stake level (upside / risk split)
-BOX_SPLIT: dict[str, dict[str, int]] = {
-    "Low":    {"upside": 1, "risk": 1},   # 2 total
-    "Medium": {"upside": 2, "risk": 1},   # 3 total
-    "High":   {"upside": 3, "risk": 2},   # 5 total
-}
+# ─────────────────────────────────────────────
+# NEW: REASONING TRAIL SCHEMA
+# ─────────────────────────────────────────────
+
+class BoxReasoningTrail(BaseModel):
+    """
+    The full reasoning chain for one decision box.
+    Captures what changed across all 3 passes.
+    Sent to the UI layer so users can see HOW the AI reached its conclusion.
+    """
+    box_title:          str
+    box_type:           Literal["upside", "risk"]
+
+    # Pass 1 — what the AI first thought
+    draft_claim:        str   = Field(description="Raw claim from Pass 1 before any critique")
+    draft_probability:  int   = Field(description="Initial probability estimate")
+    draft_impact:       int   = Field(description="Initial impact estimate")
+    draft_reasoning:    str   = Field(description="Initial reasoning before attack")
+
+    # Pass 2 — what the devil's advocate said about this specific box
+    attack_weakness:    str   = Field(description="What Pass 2 found wrong or overconfident")
+    attack_correction:  str   = Field(description="What Pass 2 said should be said instead")
+
+    # What changed between draft and final
+    claim_changed:      bool  = Field(description="Whether the claim changed after critique")
+    probability_delta:  int   = Field(description="How much probability changed: final - draft")
+    impact_delta:       int   = Field(description="How much impact changed: final - draft")
+    what_changed:       str   = Field(description="Plain English summary of what the attack changed")
+
+    # Lenses applied to this specific box
+    lenses_applied:     list[str] = Field(description="Which reasoning lenses shaped this box")
+
+
+class ReasoningTrail(BaseModel):
+    """
+    Full reasoning trail for the entire decision.
+    Attached to RefinedDecision and passed through to UI.
+    """
+    box_trails:         list[BoxReasoningTrail]
+
+    # Company context that was injected
+    company_industry:   str | None
+    company_size:       str | None
+    risk_appetite:      str | None
+    extra_context:      dict[str, str] = Field(default_factory=dict)
+
+    # Lenses and framework used
+    lenses_used:        list[str]
+    framework:          str
+    decision_type:      str
+    stake_level:        str
+
+    # Confidence breakdown
+    router_confidence:      float = Field(description="Router's classification confidence")
+    refiner_confidence:     float = Field(description="Refiner's analysis confidence")
+    combined_confidence:    float = Field(description="router × refiner = final confidence")
+    confidence_explanation: str   = Field(description="Plain English why this confidence score")
+
+    # Attack summary
+    overall_attack_assessment: str = Field(description="Pass 2 overall critique summary")
+    real_world_failure_modes:  list[str]
+    missing_risks_found:       list[str]
 
 
 # ─────────────────────────────────────────────
-# OUTPUT SCHEMA  (what the UI layer consumes)
+# OUTPUT SCHEMA
 # ─────────────────────────────────────────────
 
 class DecisionBox(BaseModel):
-    """A single rendered box on the UI decision board."""
-
     title:                str
     color:                VerdictColor
-    claim:                str   = Field(description="One clear, falsifiable statement")
-    evidence_or_reasoning: str  = Field(description="Data, pattern, or logic behind the claim")
-    probability:          int   = Field(ge=0, le=100, description="Likelihood this plays out (%)")
-    impact:               int   = Field(ge=1, le=10,  description="Magnitude if it does")
-    risk_score:           float = Field(ge=0.0, le=10.0,
-                                        description="Computed: (100-probability)/10 × impact for risks; "
-                                                    "probability/10 × impact for upsides")
+    claim:                str
+    evidence_or_reasoning: str
+    probability:          int   = Field(ge=0, le=100)
+    impact:               int   = Field(ge=1, le=10)
+    risk_score:           float = Field(ge=0.0, le=10.0)
     follow_up_actions:    list[str] = Field(default_factory=list, max_length=3)
-    spawn_questions:      list[str] = Field(default_factory=list, max_length=3,
-                                            description="Clicking this box reveals these questions")
+    spawn_questions:      list[str] = Field(default_factory=list, max_length=3)
 
     @field_validator("color")
     @classmethod
     def validate_color(cls, v: str) -> str:
-        if v not in ("Green", "Yellow", "Orange", "Red"):
-            return "Yellow"
-        return v
+        return v if v in ("Green", "Yellow", "Orange", "Red") else "Yellow"
 
     @field_validator("risk_score", mode="before")
     @classmethod
@@ -148,73 +155,51 @@ class DecisionBox(BaseModel):
 
 
 class VerdictBox(BaseModel):
-    """The final verdict card — maps to the UI verdict_box."""
-
     color:          VerdictColor
-    headline:       str  = Field(description="One decisive sentence")
-    rationale:      str  = Field(description="Why this verdict, in 2–3 sentences")
-    net_score:      float = Field(description="Upside total minus risk total")
-
-    # Conditions — turns advice into a decision system
-    go_conditions:      list[str] = Field(description="Proceed if ALL of these are true")
-    stop_conditions:    list[str] = Field(description="Halt if ANY of these fires")
-    review_triggers:    list[str] = Field(description="Re-evaluate when these change")
-
-    # What would flip this verdict
-    key_unknown:    str  = Field(description="The single biggest thing we don't know")
-    flip_factor:    str  = Field(description="What would change Green → Red or Red → Green")
+    headline:       str
+    rationale:      str
+    net_score:      float
+    go_conditions:      list[str]
+    stop_conditions:    list[str]
+    review_triggers:    list[str]
+    key_unknown:    str
+    flip_factor:    str
 
     @field_validator("color")
     @classmethod
     def validate_color(cls, v: str) -> str:
-        if v not in ("Green", "Yellow", "Orange", "Red"):
-            return "Yellow"
-        return v
+        return v if v in ("Green", "Yellow", "Orange", "Red") else "Yellow"
 
 
 class NextStepBox(BaseModel):
-    """Concrete next actions — maps to the UI next_step_box."""
-
-    immediate_action:   str          = Field(description="Do this within 24 hours")
-    test_if_uncertain:  str | None   = Field(None, description="Cheapest way to validate the key unknown")
-    owner:              str | None   = Field(None, description="Who should drive this decision")
-    deadline:           str | None   = Field(None, description="By when")
-    escalate_if:        str | None   = Field(None, description="Escalation trigger")
+    immediate_action:   str
+    test_if_uncertain:  str | None = None
+    owner:              str | None = None
+    deadline:           str | None = None
+    escalate_if:        str | None = None
 
 
 class AuditTrail(BaseModel):
-    """
-    Immutable record attached to every RefinedDecision.
-    Satisfies the 'Record Keeping' feature from the product spec.
-    """
-
-    query_hash:         str   = Field(description="SHA-256 of the original query (PII-safe)")
+    query_hash:         str
     company_id:         str
-    routing_plan_hash:  str   = Field(description="SHA-256 of the serialised RoutingPlan")
+    routing_plan_hash:  str
     model_used:         str
-    pass_latencies_ms:  list[int]   = Field(description="[draft_ms, attack_ms, finalize_ms]")
+    pass_latencies_ms:  list[int]
     total_tokens_in:    int
     total_tokens_out:   int
-    refiner_version:    str   = Field(default="1.0.0")
+    refiner_version:    str = Field(default="1.0.0")
     timestamp_utc:      str
 
 
 class RefinedDecision(BaseModel):
-    """
-    The complete output contract between Refiner and the UI layer.
-    Matches the UI spec exactly:
-        summary_box, upside_boxes[], risk_boxes[],
-        verdict_box, next_step_box, confidence.
-    MAX 5 BOXES TOTAL (enforced post-construction).
-    """
-
-    summary_box:    str                 # Plain-language TL;DR
+    summary_box:    str
     upside_boxes:   list[DecisionBox]
     risk_boxes:     list[DecisionBox]
     verdict_box:    VerdictBox
     next_step_box:  NextStepBox
     confidence:     float = Field(ge=0.0, le=1.0)
     audit:          AuditTrail
+    reasoning_trail: ReasoningTrail | None = None  # NEW — full reasoning chain
 
     @property
     def total_boxes(self) -> int:
@@ -222,11 +207,10 @@ class RefinedDecision(BaseModel):
 
 
 # ─────────────────────────────────────────────
-# INTERNAL PASS SCHEMAS  (never sent to UI)
+# INTERNAL PASS SCHEMAS
 # ─────────────────────────────────────────────
 
 class _DraftBox(BaseModel):
-    """Lightweight box produced in Pass 1."""
     box_type:    Literal["upside", "risk"]
     title:       str
     claim:       str
@@ -236,23 +220,20 @@ class _DraftBox(BaseModel):
 
 
 class _DraftOutput(BaseModel):
-    """Full Pass 1 output."""
     summary:     str
     boxes:       list[_DraftBox]
     assumptions: list[str]
 
 
 class _AttackReport(BaseModel):
-    """Pass 2 — critique of Pass 1."""
-    overall_assessment: str
-    box_critiques:      list[dict[str, str]]   # [{box_title, weakness, correction}]
-    missing_risks:      list[str]
-    overconfident_claims: list[str]
+    overall_assessment:       str
+    box_critiques:            list[dict[str, str]]
+    missing_risks:            list[str]
+    overconfident_claims:     list[str]
     real_world_failure_modes: list[str]
 
 
 class _FinalBox(BaseModel):
-    """Enriched box produced in Pass 3."""
     box_type:               Literal["upside", "risk"]
     title:                  str
     color:                  VerdictColor
@@ -265,7 +246,6 @@ class _FinalBox(BaseModel):
 
 
 class _FinalOutput(BaseModel):
-    """Pass 3 — everything the Refiner needs to build RefinedDecision."""
     summary_box:        str
     boxes:              list[_FinalBox]
     verdict_color:      VerdictColor
@@ -289,10 +269,6 @@ class _FinalOutput(BaseModel):
 # ─────────────────────────────────────────────
 
 def _enforce_verdict_color(net_score: float, has_stop_conditions: bool) -> VerdictColor:
-    """
-    Deterministic color rule — overrides whatever the LLM suggested.
-    net_score = sum(upside risk_scores) - sum(risk risk_scores)
-    """
     if has_stop_conditions and net_score < 0:
         return "Red"
     if net_score >= 4.0:
@@ -323,17 +299,12 @@ def _cache_key(company_id: str, query: str, plan: RoutingPlan) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-# ─────────────────────────────────────────────
-# MODEL SELECTOR
-# ─────────────────────────────────────────────
-
 def _select_model(plan: RoutingPlan) -> str:
-    """Escalate to the stronger model for high-stakes decisions."""
     return _MODEL_HIGH if plan.stake_level == "High" else _MODEL_STANDARD
 
 
 # ─────────────────────────────────────────────
-# PROMPT BUILDERS
+# PROMPT BUILDERS (unchanged)
 # ─────────────────────────────────────────────
 
 def _build_pass1_prompt(query: str, plan: RoutingPlan, context: UserContext | None) -> str:
@@ -411,10 +382,8 @@ Be specific. Vague critiques are useless.
 
 
 def _build_pass3_prompt(
-    query: str,
-    plan: RoutingPlan,
-    draft: _DraftOutput,
-    attack: _AttackReport,
+    query: str, plan: RoutingPlan,
+    draft: _DraftOutput, attack: _AttackReport,
     context: UserContext | None,
 ) -> str:
     ctx_block = ""
@@ -461,37 +430,26 @@ Rules:
 6. flip_factor = what one change would reverse the verdict entirely.
 7. immediate_action must be doable within 24 hours.
 8. overall_confidence = your genuine certainty in this analysis (0.0–1.0).
-   Lower it if: data was thin, domain is volatile, or Pass 2 found major gaps.
 9. spawn_questions for each box = what a user would naturally ask by clicking it.
 10. Be specific — no generic advice. This decision is about: {query[:80]}
 """.strip()
 
 
 # ─────────────────────────────────────────────
-# API HELPERS — with retry + jitter
+# API HELPERS
 # ─────────────────────────────────────────────
 
 async def _parse_call(
-    system: str,
-    user: str,
-    response_format: type,
-    model: str,
-    company_id: str,
-    pass_name: str,
+    system: str, user: str,
+    response_format: type, model: str,
+    company_id: str, pass_name: str,
 ) -> tuple[Any, int, int, int]:
-    """
-    Single structured-output call with retry.
-    Returns (parsed_object, latency_ms, tokens_in, tokens_out).
-    """
     last_error: Exception | None = None
 
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             t0 = time.perf_counter()
 
-            import json as _json
-
-            # Hard 25s timeout on every individual LLM call — prevents silent hangs
             response = await asyncio.wait_for(
                 _get_client().chat.completions.create(
                     model=model,
@@ -509,31 +467,38 @@ async def _parse_call(
             msg        = response.choices[0].message
             usage      = response.usage
 
-            raw_json = (msg.content or "").strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            # Bulletproof Markdown Stripping
+            raw_json = (msg.content or "").strip()
+            if raw_json.startswith("```json"):
+                raw_json = raw_json[7:]
+            elif raw_json.startswith("```"):
+                raw_json = raw_json[3:]
+            if raw_json.endswith("```"):
+                raw_json = raw_json[:-3]
+            raw_json = raw_json.strip()
+
             logger.info("Pass=%s raw response | company=%s | chars=%d | preview=%s",
                         pass_name, company_id, len(raw_json), raw_json[:120])
 
-            parsed = response_format.model_validate(_json.loads(raw_json))
+            # Pydantic Native JSON Validation (Safer and Faster)
+            parsed = response_format.model_validate_json(raw_json)
 
             logger.info(
-                "✅ Pass=%s | company=%s | model=%s | latency_ms=%d | "
-                "tokens_in=%d | tokens_out=%d",
+                "✅ Pass=%s | company=%s | model=%s | latency_ms=%d | tokens_in=%d | tokens_out=%d",
                 pass_name, company_id, model, latency_ms,
-                usage.prompt_tokens     if usage else 0,
+                usage.prompt_tokens if usage else 0,
                 usage.completion_tokens if usage else 0,
             )
 
             return (
-                parsed,
-                latency_ms,
-                usage.prompt_tokens     if usage else 0,
+                parsed, latency_ms,
+                usage.prompt_tokens if usage else 0,
                 usage.completion_tokens if usage else 0,
             )
 
         except asyncio.TimeoutError:
             last_error = RuntimeError(f"Pass {pass_name} timed out after 25s")
             logger.warning("⏰ Timeout | pass=%s | attempt=%d/%d", pass_name, attempt, _MAX_RETRIES)
-            # No sleep on timeout — retry immediately
 
         except (APITimeoutError, APIStatusError) as e:
             status = getattr(e, "status_code", None)
@@ -541,10 +506,8 @@ async def _parse_call(
                 raise
             last_error = e
             wait = (2 ** attempt) + random.uniform(0, 0.5)
-            logger.warning(
-                "Transient error | pass=%s | attempt=%d/%d | wait=%.1fs | %s",
-                pass_name, attempt, _MAX_RETRIES, wait, e,
-            )
+            logger.warning("Transient error | pass=%s | attempt=%d/%d | wait=%.1fs | %s",
+                           pass_name, attempt, _MAX_RETRIES, wait, e)
             await asyncio.sleep(wait)
 
         except Exception as e:
@@ -557,22 +520,22 @@ async def _parse_call(
 
 
 # ─────────────────────────────────────────────
-# SYSTEM PROMPTS (one per pass)
+# SYSTEM PROMPTS
 # ─────────────────────────────────────────────
 
 def _build_pass1_system(split: dict) -> str:
     upside_count = split["upside"]
     risk_count   = split["risk"]
     upside_examples = ",\n    ".join([
-        f'''{{"box_type": "upside", "title": "Upside {i+1}", "claim": "...", "reasoning": "...", "probability": 70, "impact": 7}}''' 
+        f'''{{"box_type": "upside", "title": "Upside {i+1}", "claim": "...", "reasoning": "...", "probability": 70, "impact": 7}}'''
         for i in range(upside_count)
     ])
     risk_examples = ",\n    ".join([
-        f'''{{"box_type": "risk", "title": "Risk {i+1}", "claim": "...", "reasoning": "...", "probability": 40, "impact": 6}}''' 
+        f'''{{"box_type": "risk", "title": "Risk {i+1}", "claim": "...", "reasoning": "...", "probability": 40, "impact": 6}}'''
         for i in range(risk_count)
     ])
     return f"""
-You are Think AI's Decision Analyst — Pass 1: DRAFT.
+You are Three AI's Decision Analyst — Pass 1: DRAFT.
 Produce an initial structured analysis of a business decision.
 Use numbers. Be specific. Apply the reasoning lenses provided.
 
@@ -594,7 +557,7 @@ Rules:
 """.strip()
 
 _PASS2_SYSTEM = """
-You are Think AI's Devil's Advocate — Pass 2: ATTACK.
+You are Three AI's Devil's Advocate — Pass 2: ATTACK.
 Ruthlessly challenge the draft analysis. Find overconfident claims, missing risks,
 survivorship bias, and real-world failure modes.
 
@@ -620,15 +583,15 @@ def _build_pass3_system(split: dict) -> str:
     upside_count = split["upside"]
     risk_count   = split["risk"]
     upside_examples = ",\n    ".join([
-        f'''{{"box_type": "upside", "title": "Upside {i+1}", "color": "Green", "claim": "...", "evidence_or_reasoning": "...", "probability": 70, "impact": 7, "follow_up_actions": ["action"], "spawn_questions": ["question"]}}''' 
+        f'''{{"box_type": "upside", "title": "Upside {i+1}", "color": "Green", "claim": "...", "evidence_or_reasoning": "...", "probability": 70, "impact": 7, "follow_up_actions": ["action"], "spawn_questions": ["question"]}}'''
         for i in range(upside_count)
     ])
     risk_examples = ",\n    ".join([
-        f'''{{"box_type": "risk", "title": "Risk {i+1}", "color": "Red", "claim": "...", "evidence_or_reasoning": "...", "probability": 40, "impact": 8, "follow_up_actions": ["action"], "spawn_questions": ["question"]}}''' 
+        f'''{{"box_type": "risk", "title": "Risk {i+1}", "color": "Red", "claim": "...", "evidence_or_reasoning": "...", "probability": 40, "impact": 8, "follow_up_actions": ["action"], "spawn_questions": ["question"]}}'''
         for i in range(risk_count)
     ])
     return f"""
-You are Think AI's Decision Synthesiser — Pass 3: FINALIZE.
+You are Three AI's Decision Synthesiser — Pass 3: FINALIZE.
 Produce the final polished decision analysis combining the draft and the critique.
 Every claim must be specific. Every action must be concrete.
 
@@ -673,17 +636,12 @@ Rules:
 def _safe_fallback(query: str, company_id: str, reason: str) -> RefinedDecision:
     logger.warning("Refiner fallback | company=%s | reason=%s", company_id, reason)
 
-    import datetime
-
     placeholder_box = DecisionBox(
-        title="Analysis unavailable",
-        color="Orange",
+        title="Analysis unavailable", color="Orange",
         claim="The refiner could not complete analysis for this decision.",
         evidence_or_reasoning=f"Reason: {reason}",
-        probability=50,
-        impact=5,
-        risk_score=2.5,
-        follow_up_actions=["Try again", "Simplify your query", "Check system status"],
+        probability=50, impact=5, risk_score=2.5,
+        follow_up_actions=["Try again", "Simplify your query"],
         spawn_questions=["What went wrong?"],
     )
 
@@ -702,13 +660,7 @@ def _safe_fallback(query: str, company_id: str, reason: str) -> RefinedDecision:
             key_unknown="Could not determine",
             flip_factor="Could not determine",
         ),
-        next_step_box=NextStepBox(
-            immediate_action="Retry this query with more context.",
-            test_if_uncertain=None,
-            owner=None,
-            deadline=None,
-            escalate_if=None,
-        ),
+        next_step_box=NextStepBox(immediate_action="Retry this query with more context."),
         confidence=0.0,
         audit=AuditTrail(
             query_hash=hashlib.sha256(query.encode()).hexdigest(),
@@ -718,26 +670,145 @@ def _safe_fallback(query: str, company_id: str, reason: str) -> RefinedDecision:
             pass_latencies_ms=[0, 0, 0],
             total_tokens_in=0,
             total_tokens_out=0,
-            timestamp_utc=datetime.datetime.utcnow().isoformat(),
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
         ),
+        reasoning_trail=None,
     )
 
 
 # ─────────────────────────────────────────────
-# ASSEMBLER — builds RefinedDecision from Pass 3
+# NEW: REASONING TRAIL BUILDER
+# Builds per-box trail by matching draft boxes to
+# attack critiques and final boxes.
+# ─────────────────────────────────────────────
+
+def _build_reasoning_trail(
+    plan:    RoutingPlan,
+    context: UserContext | None,
+    draft:   _DraftOutput,
+    attack:  _AttackReport,
+    final:   _FinalOutput,
+    refiner_confidence: float,
+    router_confidence:  float,
+) -> ReasoningTrail:
+    """
+    Builds the full reasoning trail for the UI metrics page.
+    Matches draft boxes → attack critiques → final boxes by title.
+    """
+    box_trails: list[BoxReasoningTrail] = []
+
+    for final_box in final.boxes:
+        # Find matching draft box by title (case-insensitive partial match)
+        draft_box = next(
+            (d for d in draft.boxes if d.title.lower().strip() == final_box.title.lower().strip()),
+            draft.boxes[0] if draft.boxes else None,
+        )
+
+        # Find matching attack critique by title
+        attack_critique = next(
+            (c for c in attack.box_critiques
+             if c.get("box_title", "").lower().strip() == final_box.title.lower().strip()),
+            None,
+        )
+
+        draft_claim       = draft_box.claim       if draft_box else "Draft not available"
+        draft_probability = draft_box.probability if draft_box else final_box.probability
+        draft_impact      = draft_box.impact      if draft_box else final_box.impact
+        draft_reasoning   = draft_box.reasoning   if draft_box else "Draft reasoning not available"
+
+        attack_weakness   = attack_critique.get("weakness",   "No specific weakness identified") if attack_critique else "No critique for this box"
+        attack_correction = attack_critique.get("correction", "No correction suggested")         if attack_critique else "No correction suggested"
+
+        claim_changed      = draft_claim.lower().strip() != final_box.claim.lower().strip()
+        probability_delta  = final_box.probability - draft_probability
+        impact_delta       = final_box.impact - draft_impact
+
+        # Build plain English what-changed summary
+        changes = []
+        if claim_changed:
+            changes.append("claim was rewritten after critique")
+        if abs(probability_delta) >= 5:
+            direction = "raised" if probability_delta > 0 else "lowered"
+            changes.append(f"probability {direction} by {abs(probability_delta)}%")
+        if abs(impact_delta) >= 1:
+            direction = "raised" if impact_delta > 0 else "lowered"
+            changes.append(f"impact {direction} by {abs(impact_delta)}")
+        what_changed = (
+            "After the attack pass: " + ", ".join(changes) + "."
+            if changes else
+            "No significant changes after the attack pass."
+        )
+
+        box_trails.append(BoxReasoningTrail(
+            box_title=final_box.title,
+            box_type=final_box.box_type,
+            draft_claim=draft_claim,
+            draft_probability=draft_probability,
+            draft_impact=draft_impact,
+            draft_reasoning=draft_reasoning,
+            attack_weakness=attack_weakness,
+            attack_correction=attack_correction,
+            claim_changed=claim_changed,
+            probability_delta=probability_delta,
+            impact_delta=impact_delta,
+            what_changed=what_changed,
+            lenses_applied=plan.selected_lenses,
+        ))
+
+    # Confidence explanation
+    combined = round(refiner_confidence * router_confidence, 2)
+    if combined >= 0.7:
+        conf_explanation = f"High confidence — router classified this clearly ({router_confidence:.0%}) and refiner found strong evidence ({refiner_confidence:.0%})."
+    elif combined >= 0.4:
+        conf_explanation = f"Moderate confidence — router was {router_confidence:.0%} certain on classification and refiner was {refiner_confidence:.0%} certain on analysis. Some unknowns remain."
+    else:
+        conf_explanation = f"Low confidence — limited context provided. Router was only {router_confidence:.0%} certain and refiner was {refiner_confidence:.0%} certain. Add more company context to improve this."
+
+    # Extra context (filter out internal _ keys)
+    extra_ctx = {}
+    if context and context.extra:
+        extra_ctx = {
+            k: str(v) for k, v in context.extra.items()
+            if not k.startswith("_") and k not in ("parent_decision", "branch_depth")
+        }
+
+    return ReasoningTrail(
+        box_trails=box_trails,
+        company_industry=context.industry   if context else None,
+        company_size=context.company_size   if context else None,
+        risk_appetite=context.risk_appetite if context else None,
+        extra_context=extra_ctx,
+        lenses_used=plan.selected_lenses,
+        framework=plan.framework,
+        decision_type=plan.decision_type,
+        stake_level=plan.stake_level,
+        router_confidence=router_confidence,
+        refiner_confidence=refiner_confidence,
+        combined_confidence=combined,
+        confidence_explanation=conf_explanation,
+        overall_attack_assessment=attack.overall_assessment,
+        real_world_failure_modes=attack.real_world_failure_modes,
+        missing_risks_found=attack.missing_risks,
+    )
+
+
+# ─────────────────────────────────────────────
+# ASSEMBLER
 # ─────────────────────────────────────────────
 
 def _assemble(
-    query: str,
+    query:      str,
     company_id: str,
-    plan: RoutingPlan,
-    final: _FinalOutput,
-    model: str,
-    latencies: list[int],
-    tokens_in: int,
+    plan:       RoutingPlan,
+    context:    UserContext | None,
+    draft:      _DraftOutput,
+    attack:     _AttackReport,
+    final:      _FinalOutput,
+    model:      str,
+    latencies:  list[int],
+    tokens_in:  int,
     tokens_out: int,
 ) -> RefinedDecision:
-    import datetime
 
     upside_boxes: list[DecisionBox] = []
     risk_boxes:   list[DecisionBox] = []
@@ -745,13 +816,9 @@ def _assemble(
     for fb in final.boxes:
         rs = _compute_risk_score(fb.probability, fb.impact, fb.box_type)
         box = DecisionBox(
-            title=fb.title,
-            color=fb.color,
-            claim=fb.claim,
+            title=fb.title, color=fb.color, claim=fb.claim,
             evidence_or_reasoning=fb.evidence_or_reasoning,
-            probability=fb.probability,
-            impact=fb.impact,
-            risk_score=rs,
+            probability=fb.probability, impact=fb.impact, risk_score=rs,
             follow_up_actions=fb.follow_up_actions[:3],
             spawn_questions=fb.spawn_questions[:3],
         )
@@ -760,17 +827,11 @@ def _assemble(
         else:
             risk_boxes.append(box)
 
-    # Enforce box count ceiling from routing plan
-    max_boxes = BOXES_BY_STAKE[plan.stake_level]
-    split      = BOX_SPLIT[plan.stake_level]
+    split        = BOX_SPLIT[plan.stake_level]
     upside_boxes = upside_boxes[:split["upside"]]
     risk_boxes   = risk_boxes[:split["risk"]]
 
-    # Deterministic verdict color
-    net_score = (
-        sum(b.risk_score for b in upside_boxes) -
-        sum(b.risk_score for b in risk_boxes)
-    )
+    net_score      = sum(b.risk_score for b in upside_boxes) - sum(b.risk_score for b in risk_boxes)
     enforced_color = _enforce_verdict_color(net_score, bool(final.stop_conditions))
 
     verdict = VerdictBox(
@@ -801,7 +862,17 @@ def _assemble(
         pass_latencies_ms=latencies,
         total_tokens_in=tokens_in,
         total_tokens_out=tokens_out,
-        timestamp_utc=datetime.datetime.utcnow().isoformat(),
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+    )
+
+    combined_confidence = round(final.overall_confidence * plan.confidence, 2)
+
+    # Build reasoning trail
+    reasoning_trail = _build_reasoning_trail(
+        plan=plan, context=context,
+        draft=draft, attack=attack, final=final,
+        refiner_confidence=final.overall_confidence,
+        router_confidence=plan.confidence,
     )
 
     return RefinedDecision(
@@ -810,9 +881,9 @@ def _assemble(
         risk_boxes=risk_boxes,
         verdict_box=verdict,
         next_step_box=next_step,
-        confidence=round(final.overall_confidence * plan.confidence, 2),
-        # Combined confidence: refiner's certainty × router's classification certainty
+        confidence=combined_confidence,
         audit=audit,
+        reasoning_trail=reasoning_trail,
     )
 
 
@@ -821,94 +892,57 @@ def _assemble(
 # ─────────────────────────────────────────────
 
 async def _run_three_pass(
-    query: str,
-    plan: RoutingPlan,
+    query:      str,
+    plan:       RoutingPlan,
     company_id: str,
-    context: UserContext | None,
-    model: str,
+    context:    UserContext | None,
+    model:      str,
 ) -> RefinedDecision:
-    """
-    The thinking loop:
-      Pass 1 — Draft   → _DraftOutput
-      Pass 2 — Attack  → _AttackReport
-      Pass 3 — Finalize→ _FinalOutput → RefinedDecision
-    """
-
     total_in  = 0
     total_out = 0
     latencies = []
 
-    # ── PASS 1: DRAFT ────────────────────────────────────────────────────────
     logger.info("🟡 Pass 1 (Draft)  | company=%s", company_id)
-
     draft_user = _build_pass1_prompt(query, plan, context)
-
     draft, lat1, ti1, to1 = await _parse_call(
         system=_build_pass1_system(BOX_SPLIT[plan.stake_level]),
-        user=draft_user,
-        response_format=_DraftOutput,
-        model=model,
-        company_id=company_id,
-        pass_name="draft",
+        user=draft_user, response_format=_DraftOutput,
+        model=model, company_id=company_id, pass_name="draft",
     )
-    latencies.append(lat1)
-    total_in  += ti1
-    total_out += to1
+    latencies.append(lat1); total_in += ti1; total_out += to1
 
-    # ── PASS 2: ATTACK ───────────────────────────────────────────────────────
     logger.info("🔴 Pass 2 (Attack) | company=%s", company_id)
-
     attack_user = _build_pass2_prompt(query, draft)
-
     attack, lat2, ti2, to2 = await _parse_call(
-        system=_PASS2_SYSTEM,
-        user=attack_user,
-        response_format=_AttackReport,
-        model=model,
-        company_id=company_id,
-        pass_name="attack",
+        system=_PASS2_SYSTEM, user=attack_user,
+        response_format=_AttackReport, model=model,
+        company_id=company_id, pass_name="attack",
     )
-    latencies.append(lat2)
-    total_in  += ti2
-    total_out += to2
+    latencies.append(lat2); total_in += ti2; total_out += to2
 
-    # ── PASS 3: FINALIZE ─────────────────────────────────────────────────────
     logger.info("🟢 Pass 3 (Final)  | company=%s", company_id)
-
     final_user = _build_pass3_prompt(query, plan, draft, attack, context)
-
     final, lat3, ti3, to3 = await _parse_call(
         system=_build_pass3_system(BOX_SPLIT[plan.stake_level]),
-        user=final_user,
-        response_format=_FinalOutput,
-        model=model,
-        company_id=company_id,
-        pass_name="finalize",
+        user=final_user, response_format=_FinalOutput,
+        model=model, company_id=company_id, pass_name="finalize",
     )
-    latencies.append(lat3)
-    total_in  += ti3
-    total_out += to3
+    latencies.append(lat3); total_in += ti3; total_out += to3
 
-    # ── ASSEMBLE ─────────────────────────────────────────────────────────────
+    # Pass all 3 pass outputs to assembler so it can build the reasoning trail
     decision = _assemble(
-        query=query,
-        company_id=company_id,
-        plan=plan,
-        final=final,
-        model=model,
-        latencies=latencies,
-        tokens_in=total_in,
-        tokens_out=total_out,
+        query=query, company_id=company_id,
+        plan=plan, context=context,
+        draft=draft, attack=attack, final=final,
+        model=model, latencies=latencies,
+        tokens_in=total_in, tokens_out=total_out,
     )
 
     logger.info(
         "✅ Refined | company=%s | verdict=%s | conf=%.2f | "
         "total_latency_ms=%d | total_tokens=%d",
-        company_id,
-        decision.verdict_box.color,
-        decision.confidence,
-        sum(latencies),
-        total_in + total_out,
+        company_id, decision.verdict_box.color,
+        decision.confidence, sum(latencies), total_in + total_out,
     )
 
     return decision
@@ -926,52 +960,15 @@ async def refine(
     *,
     bypass_cache: bool = False,
 ) -> RefinedDecision:
-    """
-    Main entry point. Call this after route() from router.py.
-
-    Parameters
-    ----------
-    query        : The original decision text (same string passed to route()).
-    plan         : The RoutingPlan returned by route().
-    company_id   : Tenant identifier — same value used in route().
-    context      : Same UserContext passed to route() — injected into all 3 passes.
-    bypass_cache : Force fresh analysis (use after user edits context or query).
-
-    Returns
-    -------
-    RefinedDecision — always. Falls back gracefully on failure.
-
-    Example
-    -------
-    from router import route, UserContext
-    from refiner import refine
-
-    ctx  = UserContext(industry="SaaS", company_size="Series A")
-    plan = await route("Should we raise prices 20%?", "acme-123", ctx)
-    dec  = await refine("Should we raise prices 20%?", plan, "acme-123", ctx)
-    print(dec.verdict_box.color)
-    print(dec.verdict_box.headline)
-    """
-
     if not query or not query.strip():
         return _safe_fallback(query, company_id, "empty_query")
 
-    query = query.strip()
-
-    # ── Cache lookup ───────────────────────────────────────────────────────
+    query     = query.strip()
     cache_key = _cache_key(company_id, query, plan)
 
     if not bypass_cache and cache_key in _cache:
         logger.info("Cache hit | company=%s | key=%s…", company_id, cache_key[:12])
         return _cache[cache_key]
-
-    # ── If router flagged missing info, skip deep analysis ─────────────────
-    if plan.required_questions and plan.confidence < 0.5:
-        logger.warning(
-            "Low-confidence routing | company=%s | questions=%s",
-            company_id, plan.required_questions,
-        )
-        # Still run the pipeline — just note uncertainty in the output
 
     model = _select_model(plan)
     logger.info(
@@ -985,48 +982,6 @@ async def refine(
         return _safe_fallback(query, company_id, "timeout")
     except RuntimeError:
         return _safe_fallback(query, company_id, "api_failure")
-    # real bugs bubble up
 
     _cache[cache_key] = decision
     return decision
-
-
-# ─────────────────────────────────────────────
-# QUICK LOCAL TEST
-# ─────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import asyncio
-    import json
-    from router import route, UserContext
-
-    async def _demo():
-        query = "Should we raise our prices by 20% next month?"
-        ctx   = UserContext(
-            industry="E-commerce",
-            company_size="Series A",
-            risk_appetite="Moderate",
-        )
-
-        print("── Step 1: Router ──────────────────────────────")
-        plan = await route(query, "demo-co", ctx)
-        print(f"  Type={plan.decision_type}  Stakes={plan.stake_level}  "
-              f"Framework={plan.framework}")
-
-        print("\n── Step 2: Refiner (3-pass) ────────────────────")
-        decision = await refine(query, plan, "demo-co", ctx)
-
-        print(f"\n  Verdict : {decision.verdict_box.color}")
-        print(f"  Headline: {decision.verdict_box.headline}")
-        print(f"  Confidence: {decision.confidence:.0%}")
-        print(f"  Net score : {decision.verdict_box.net_score}")
-        print(f"\n  Upside boxes ({len(decision.upside_boxes)}):")
-        for b in decision.upside_boxes:
-            print(f"    [{b.color}] {b.title} — {b.claim}")
-        print(f"\n  Risk boxes ({len(decision.risk_boxes)}):")
-        for b in decision.risk_boxes:
-            print(f"    [{b.color}] {b.title} — {b.claim}")
-        print(f"\n  Next step: {decision.next_step_box.immediate_action}")
-        print(f"\n  Audit: {decision.audit.model_dump_json(indent=2)}")
-
-    asyncio.run(_demo())

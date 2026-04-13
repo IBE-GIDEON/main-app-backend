@@ -5,9 +5,9 @@ cachetools
 python-dotenv
 fastapi
 uvicorn[standard]
-openai
 cachetools
 slowapi
 cryptography
 httpx
 python-multipart
+supabase>=2.0.0
