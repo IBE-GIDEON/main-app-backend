@@ -83,6 +83,12 @@ from insights_runtime import (
     refresh_company_insights,
     run_background_insights_monitor,
 )
+from billing import (
+    BillingStatusResponse,
+    PaystackVerifyRequest,
+    get_billing_status,
+    verify_paystack_payment,
+)
 
 # ─────────────────────────────────────────────
 # CONFIG & CACHE
@@ -777,6 +783,31 @@ async def delete_memory(request: Request, company_id: str, _auth: None = Depends
 
 
     # ─────────────────────────────────────────────
+@app.get("/billing/{company_id}", response_model=BillingStatusResponse, tags=["Billing"])
+@limiter.limit("30/minute")
+async def read_billing_status(
+    request: Request,
+    company_id: str,
+    _auth: None = Depends(require_api_key),
+) -> BillingStatusResponse:
+    return await get_billing_status(company_id.strip())
+
+
+@app.post("/billing/paystack/verify", response_model=BillingStatusResponse, tags=["Billing"])
+@limiter.limit("20/minute")
+async def verify_paystack_route(
+    request: Request,
+    body: PaystackVerifyRequest,
+    _auth: None = Depends(require_api_key),
+) -> BillingStatusResponse:
+    try:
+        return await verify_paystack_payment(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.get("/conditions/{company_id}", response_model=ConditionReport, tags=["Conditions"])
 @limiter.limit("30/minute")
 async def list_conditions(request: Request, company_id: str, _auth: None = Depends(require_api_key)) -> ConditionReport:

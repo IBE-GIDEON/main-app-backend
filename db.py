@@ -48,6 +48,7 @@ _VALID_TABLES = {
     "memory_store",
     "audit_store",
     "conditions_store",
+    "billing_store",
     "feedback_store",
     "marketplace_store",
 }
