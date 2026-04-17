@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "updated_utc": "2026-04-17T09:58:59.271157+00:00",
+  "updated_utc": "2026-04-17T10:18:44.559113+00:00",
   "companies": [
     {
       "company_id": "co_28a7031ed79b45f4",
@@ -8,9 +8,21 @@
       "status": "healthy",
       "enrolled_utc": "2026-04-17T01:00:22.542913+00:00",
       "last_requested_utc": "2026-04-17T08:52:28.818134+00:00",
-      "last_completed_utc": "2026-04-17T09:58:59.271157+00:00",
-      "next_due_utc": "2026-04-17T10:03:59.271157+00:00",
-      "last_duration_ms": 91157,
+      "last_completed_utc": "2026-04-17T10:17:48.635730+00:00",
+      "next_due_utc": "2026-04-17T10:22:48.635730+00:00",
+      "last_duration_ms": 75653,
+      "last_error": null,
+      "last_reason": "refresh"
+    },
+    {
+      "company_id": "co_ef3a565352334a76",
+      "active": true,
+      "status": "healthy",
+      "enrolled_utc": "2026-04-17T10:17:31.800783+00:00",
+      "last_requested_utc": "2026-04-17T10:17:31.800783+00:00",
+      "last_completed_utc": "2026-04-17T10:18:44.486344+00:00",
+      "next_due_utc": "2026-04-17T10:23:44.559113+00:00",
+      "last_duration_ms": 72685,
       "last_error": null,
       "last_reason": "refresh"
     }
