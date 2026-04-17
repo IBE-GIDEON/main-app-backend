@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Literal, Any
@@ -113,6 +114,15 @@ class UIAudit(BaseModel):
     cache_bypassed: bool | None = None
 
 
+class UIFinanceHealthItem(BaseModel):
+    metric_name: str
+    label: str
+    value: float | int | str | None = None
+    unit: str
+    status: Literal["green", "yellow", "red"] | None = None
+    description: str | None = None
+
+
 class UIFinanceSnapshot(BaseModel):
     as_of_utc: str | None = None
     currency: str | None = None
@@ -164,6 +174,28 @@ class UIFinanceSnapshot(BaseModel):
 
     headcount: int | None = None
     notes: list[str] = Field(default_factory=list)
+    health_summary: list[UIFinanceHealthItem] = Field(default_factory=list)
+
+
+class UIBlockMetric(BaseModel):
+    label: str
+    value: str
+    tone: Literal["neutral", "positive", "warning", "critical", "info"] = "neutral"
+
+
+class UITableData(BaseModel):
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+
+
+class UIBlock(BaseModel):
+    id: str
+    type: Literal["status", "markdown", "table", "metric_grid", "callout"]
+    title: str | None = None
+    text: str | None = None
+    tone: Literal["neutral", "positive", "warning", "critical", "info"] | None = None
+    table: UITableData | None = None
+    metrics: list[UIBlockMetric] = Field(default_factory=list)
 
 
 class UIDecisionPayload(BaseModel):
@@ -185,6 +217,12 @@ class UIDecisionPayload(BaseModel):
 
     reasoning_trail: ReasoningTrail | None = None
     finance_snapshot: UIFinanceSnapshot | None = None
+
+
+class UIAssistantEnvelope(BaseModel):
+    kind: Literal["decision", "chat", "action"]
+    blocks: list[UIBlock] = Field(default_factory=list)
+    decision: UIDecisionPayload | None = None
 
 
 # ─────────────────────────────────────────────
@@ -291,6 +329,10 @@ def _build_finance_snapshot(context: UserContext | None) -> UIFinanceSnapshot | 
     if not isinstance(notes, list):
         notes = []
 
+    raw_health_summary = extra.get("health_summary", [])
+    if not isinstance(raw_health_summary, list):
+        raw_health_summary = []
+
     snapshot = UIFinanceSnapshot(
         as_of_utc=extra.get("as_of_utc"),
         currency=extra.get("currency"),
@@ -342,6 +384,18 @@ def _build_finance_snapshot(context: UserContext | None) -> UIFinanceSnapshot | 
 
         headcount=_to_int(extra.get("headcount")),
         notes=[str(x) for x in notes],
+        health_summary=[
+            UIFinanceHealthItem(
+                metric_name=str(item.get("metric_name", "")),
+                label=str(item.get("label", item.get("metric_name", ""))),
+                value=item.get("value"),
+                unit=str(item.get("unit", "")),
+                status=item.get("status"),
+                description=item.get("description"),
+            )
+            for item in raw_health_summary
+            if isinstance(item, dict) and item.get("metric_name")
+        ],
     )
 
     has_real_data = any(
@@ -355,6 +409,195 @@ def _build_finance_snapshot(context: UserContext | None) -> UIFinanceSnapshot | 
     ) or bool(snapshot.sources_used)
 
     return snapshot if has_real_data else None
+
+
+def _block_id(*parts: str) -> str:
+    raw = "|".join(part.strip().lower() for part in parts if part)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _format_metric_value(value: Any, suffix: str = "") -> str:
+    if value is None or value == "":
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.2f}{suffix}" if not value.is_integer() else f"{int(value)}{suffix}"
+    return f"{value}{suffix}"
+
+
+def _format_currency(value: float | None, currency: str | None) -> str:
+    if value is None:
+        return "n/a"
+    code = (currency or "USD").upper()
+    return f"{code} {value:,.0f}" if float(value).is_integer() else f"{code} {value:,.2f}"
+
+
+def _tone_from_status(status: str | None) -> Literal["neutral", "positive", "warning", "critical", "info"]:
+    mapping = {
+        "green": "positive",
+        "yellow": "warning",
+        "red": "critical",
+    }
+    return mapping.get((status or "").lower(), "neutral")
+
+
+def _build_metric_grid_block(snapshot: UIFinanceSnapshot | None) -> UIBlock | None:
+    if not snapshot:
+        return None
+
+    health_lookup = {item.metric_name: item.status for item in snapshot.health_summary}
+    metrics = [
+        ("Cash balance", _format_currency(snapshot.cash_balance, snapshot.currency), health_lookup.get("cash_balance")),
+        ("Runway", _format_metric_value(snapshot.runway_months, " mo"), health_lookup.get("runway_months")),
+        ("Burn", _format_currency(snapshot.monthly_burn, snapshot.currency), health_lookup.get("monthly_burn")),
+        ("Revenue growth", _format_metric_value(snapshot.revenue_growth_pct, "%"), health_lookup.get("revenue_growth_pct")),
+        ("Gross margin", _format_metric_value(snapshot.gross_margin_pct, "%"), health_lookup.get("gross_margin_pct")),
+        (
+            "Failed payments",
+            _format_metric_value(snapshot.failed_payment_rate_pct, "%"),
+            health_lookup.get("failed_payment_rate_pct"),
+        ),
+    ]
+    visible = [item for item in metrics if item[1] != "n/a"]
+    if not visible:
+        return None
+
+    return UIBlock(
+        id=_block_id("metric-grid", *(label for label, _, _ in visible)),
+        type="metric_grid",
+        title="Live finance snapshot",
+        tone="info" if snapshot.is_live_data else "neutral",
+        metrics=[
+            UIBlockMetric(label=label, value=value, tone=_tone_from_status(status))
+            for label, value, status in visible
+        ],
+    )
+
+
+def _split_table_cells(line: str) -> list[str]:
+    cleaned = line.strip().strip("|")
+    return [cell.strip() for cell in cleaned.split("|")]
+
+
+def _is_table_separator(line: str) -> bool:
+    stripped = line.strip()
+    return bool(re.match(r"^\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?$", stripped))
+
+
+def _parse_markdown_blocks(text: str) -> list[UIBlock]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    lines = stripped.splitlines()
+    blocks: list[UIBlock] = []
+    markdown_buffer: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        current_line = lines[index]
+        has_table = (
+            "|" in current_line
+            and index + 1 < len(lines)
+            and _is_table_separator(lines[index + 1])
+        )
+
+        if not has_table:
+            markdown_buffer.append(current_line)
+            index += 1
+            continue
+
+        buffered_text = "\n".join(markdown_buffer).strip()
+        if buffered_text:
+            blocks.append(
+                UIBlock(
+                    id=_block_id("markdown", buffered_text[:80]),
+                    type="markdown",
+                    text=buffered_text,
+                )
+            )
+            markdown_buffer = []
+
+        table_lines = [current_line]
+        index += 2
+        while index < len(lines) and "|" in lines[index]:
+            table_lines.append(lines[index])
+            index += 1
+
+        header = _split_table_cells(table_lines[0])
+        rows = [_split_table_cells(line) for line in table_lines[1:]]
+        normalized_rows = [row[: len(header)] for row in rows if row and any(cell for cell in row)]
+
+        if header and normalized_rows:
+            blocks.append(
+                UIBlock(
+                    id=_block_id("table", *header),
+                    type="table",
+                    table=UITableData(columns=header, rows=normalized_rows),
+                )
+            )
+
+    buffered_text = "\n".join(markdown_buffer).strip()
+    if buffered_text:
+        blocks.append(
+            UIBlock(
+                id=_block_id("markdown-tail", buffered_text[:80]),
+                type="markdown",
+                text=buffered_text,
+            )
+        )
+
+    return blocks
+
+
+def build_assistant_envelope_from_decision(payload: UIDecisionPayload) -> UIAssistantEnvelope:
+    snapshot_block = _build_metric_grid_block(payload.finance_snapshot)
+    blocks = [
+        UIBlock(
+            id=_block_id("decision-status", payload.query, payload.verdict_card.headline),
+            type="status",
+            title="Decision engine",
+            text=payload.verdict_card.headline,
+            tone="info",
+        )
+    ]
+    if snapshot_block:
+        blocks.append(snapshot_block)
+
+    if payload.finance_snapshot and payload.finance_snapshot.notes:
+        blocks.append(
+            UIBlock(
+                id=_block_id("decision-notes", payload.query),
+                type="callout",
+                title="Evidence notes",
+                text="\n".join(f"- {note}" for note in payload.finance_snapshot.notes[:5]),
+                tone="warning",
+            )
+        )
+
+    return UIAssistantEnvelope(kind="decision", blocks=blocks, decision=payload)
+
+
+def build_assistant_envelope_from_text(text: str, kind: Literal["chat", "action"]) -> UIAssistantEnvelope:
+    base_title = "Analyst response" if kind == "chat" else "Action plan"
+    blocks = [
+        UIBlock(
+            id=_block_id("status", kind, text[:80]),
+            type="status",
+            title=base_title,
+            text="Structured response ready.",
+            tone="info",
+        )
+    ]
+    blocks.extend(_parse_markdown_blocks(text))
+    if len(blocks) == 1:
+        blocks.append(
+            UIBlock(
+                id=_block_id("markdown-fallback", kind, text[:80]),
+                type="markdown",
+                text=text.strip(),
+            )
+        )
+    return UIAssistantEnvelope(kind=kind, blocks=blocks, decision=None)
 
 
 # ─────────────────────────────────────────────

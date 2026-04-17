@@ -419,6 +419,23 @@ def _build_export(record: AuditRecord) -> AuditExport:
     )
 
 
+def _build_audit_list_item(record: AuditRecord) -> AuditListItem:
+    return AuditListItem(
+        record_id=record.record_id,
+        decision_id=record.decision_id,
+        version=record.version,
+        query_preview=record.query_preview,
+        decision_type=record.routing_snapshot.decision_type,
+        stake_level=record.routing_snapshot.stake_level,
+        verdict_color=record.verdict_snapshot.color,
+        net_score=record.verdict_snapshot.net_score,
+        confidence=record.routing_snapshot.confidence,
+        total_boxes=len(record.boxes),
+        is_branch=record.is_branch,
+        created_utc=record.created_utc,
+    )
+
+
 # ─────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────
@@ -523,23 +540,7 @@ async def list_audit_records(
         records = [r for r in records if r.verdict_snapshot.color == verdict_color]
 
     page = records[offset: offset + limit]
-    return [
-        AuditListItem(
-            record_id=r.record_id,
-            decision_id=r.decision_id,
-            version=r.version,
-            query_preview=r.query_preview,
-            decision_type=r.routing_snapshot.decision_type,
-            stake_level=r.routing_snapshot.stake_level,
-            verdict_color=r.verdict_snapshot.color,
-            net_score=r.verdict_snapshot.net_score,
-            confidence=r.routing_snapshot.confidence,
-            total_boxes=len(r.boxes),
-            is_branch=r.is_branch,
-            created_utc=r.created_utc,
-        )
-        for r in page
-    ]
+    return [_build_audit_list_item(record) for record in page]
 
 
 async def diff_versions(
@@ -666,5 +667,52 @@ async def delete_audit_record(company_id: str, record_id: str) -> bool:
     except Exception as e:
         logger.error("delete_audit_record error | %s", e)
         return False
+    finally:
+        lock.release()
+
+
+async def rename_audit_record(
+    company_id: str,
+    record_id: str,
+    query_preview: str,
+) -> AuditListItem | None:
+    lock = _get_lock(company_id)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=_LOCK_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning("Audit rename lock timeout | company_hash=%s", _company_hash(company_id)[:12])
+        return None
+
+    try:
+        store = await _read_store(company_id)
+        if not store:
+            return None
+
+        normalized_preview = " ".join(query_preview.strip().split())
+        if not normalized_preview:
+            return None
+
+        for index, record in enumerate(store.records):
+            if record.record_id != record_id:
+                continue
+
+            updated_record = record.model_copy(update={"query_preview": normalized_preview})
+            store.records[index] = updated_record
+            store.last_updated_utc = datetime.now(timezone.utc).isoformat()
+            success = await _write_store(company_id, store)
+            if not success:
+                return None
+
+            logger.info(
+                "✏️ Audit record renamed | company_hash=%s | record_id=%s",
+                _company_hash(company_id)[:12],
+                record_id,
+            )
+            return _build_audit_list_item(updated_record)
+
+        return None
+    except Exception as e:
+        logger.error("rename_audit_record error | %s", e)
+        return None
     finally:
         lock.release()

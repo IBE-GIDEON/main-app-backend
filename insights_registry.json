@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "updated_utc": "2026-04-17T08:53:34.238310+00:00",
+  "companies": [
+    {
+      "company_id": "co_28a7031ed79b45f4",
+      "active": true,
+      "status": "healthy",
+      "enrolled_utc": "2026-04-17T01:00:22.542913+00:00",
+      "last_requested_utc": "2026-04-17T08:52:28.818134+00:00",
+      "last_completed_utc": "2026-04-17T08:53:34.237219+00:00",
+      "next_due_utc": "2026-04-17T08:58:34.238310+00:00",
+      "last_duration_ms": 65416,
+      "last_error": null,
+      "last_reason": "refresh"
+    }
+  ]
+}
